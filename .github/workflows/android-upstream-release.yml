@@ -185,8 +185,11 @@ jobs:
                   assert 'application-debuggable' not in badging, 'APK is debuggable'
                   sig = pathlib.Path('release-artifacts/signature.txt').read_text()
                   assert sig.startswith('Verifies') and 'Number of signers: 1' in sig, 'signature verification failed'
-                  certs = re.findall(r'Signer #1 certificate SHA-256 digest: ([0-9a-f]{64})', sig)
-                  assert certs == [env['SIGNING_CERT_SHA256']], f'unexpected signing certificate {certs}'
+                  # Label differs by apksigner version ("Signer #1 certificate ..." up to 36, "V2 Signer: certificate ..." in 37).
+                  certs = sorted(set(re.findall(r'certificate SHA-256 digest: ([0-9a-f]{64})', sig)))
+                  if certs != [env['SIGNING_CERT_SHA256']]:
+                      print(sig)
+                      raise AssertionError(f'unexpected signing certificate {certs}')
                   resources = (tmp / 'resources.txt').read_text()
                   assert re.search(r'string/project_id\s*\n\s*\(\) "' + re.escape(env['FIREBASE_PROJECT_ID']) + '"', resources), \
                       'Firebase configuration missing from the APK'
