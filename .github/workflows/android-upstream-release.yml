@@ -1,0 +1,283 @@
+name: Android APK Release (follow upstream)
+
+# When tiann/hapi publishes a new stable tag vX.Y.Z, build the Android APK from
+# exactly that tag and publish it here as release android-vX.Y.Z:
+#   - versionName is the official version (X.Y.Z); versionCode is the commit
+#     count at the tag, the same rule the official build uses;
+#   - signed with this fork's persistent key, so installed apps upgrade in place;
+#   - carries this fork's Firebase project, so push works with a hub that has
+#     that project's service account.
+# The source is the upstream tag itself, so this fork's main need not be synced.
+#
+# Repository secrets:
+#   HAPI_SII_ANDROID_KEYSTORE_BASE64    base64 of the fork release keystore
+#   HAPI_SII_ANDROID_KEYSTORE_PASSWORD  keystore password (also the key password)
+#   HAPI_SII_GOOGLE_SERVICES_JSON       android/app/google-services.json of the Firebase project
+
+on:
+    schedule:
+        # Hourly. GitHub may delay scheduled runs under load.
+        - cron: '23 * * * *'
+    workflow_dispatch:
+        inputs:
+            version:
+                description: 'Upstream version to build, e.g. 0.36.8 (empty = newest upstream release)'
+                required: false
+                type: string
+            dry_run:
+                description: 'Build and verify only, without publishing (also rebuilds versions that already have a release)'
+                required: false
+                type: boolean
+                default: false
+
+permissions:
+    contents: read
+
+concurrency:
+    group: android-upstream-release
+    cancel-in-progress: false
+
+env:
+    UPSTREAM_REPO: tiann/hapi
+    FIREBASE_PROJECT_ID: hapi-phone-sii
+    # Fork signing certificate. A different key would force users to uninstall and lose app data.
+    SIGNING_CERT_SHA256: 2ae0d183736a3bddbede193c7415e446b322fc2ab03c8278c63ecc63b3a59e3a
+
+jobs:
+    check:
+        if: github.repository == 'Hashmapw/HAPI-Phone'
+        runs-on: ubuntu-latest
+        timeout-minutes: 10
+        permissions:
+            contents: read
+            actions: write
+        outputs:
+            build: ${{ steps.pick.outputs.build }}
+            version: ${{ steps.pick.outputs.version }}
+            commit: ${{ steps.pick.outputs.commit }}
+        steps:
+            - name: Keep the schedule alive
+              # GitHub disables scheduled workflows in public repositories after 60 days
+              # without repository activity; re-enabling through the API resets that clock.
+              if: github.event_name == 'schedule'
+              env:
+                  GH_TOKEN: ${{ github.token }}
+              run: gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/android-upstream-release.yml/enable" || echo "::warning::Could not refresh the workflow schedule"
+            - name: Pick the upstream release
+              id: pick
+              env:
+                  GH_TOKEN: ${{ github.token }}
+                  REQUESTED: ${{ inputs.version }}
+                  DRY_RUN: ${{ inputs.dry_run }}
+              run: |
+                  set -euo pipefail
+                  refs=$(git ls-remote --tags "https://github.com/$UPSTREAM_REPO.git")
+                  if [ -n "${REQUESTED:-}" ]; then
+                      version="${REQUESTED#v}"
+                  else
+                      version=$(awk '{ print $2 }' <<<"$refs" | sed -nE 's#^refs/tags/v([0-9]+\.[0-9]+\.[0-9]+)$#\1#p' | sort -V | tail -n 1)
+                  fi
+                  [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::No usable upstream version (got '$version')"; exit 1; }
+                  # Annotated tags list a peeled ^{} line with the commit; lightweight tags point at it directly.
+                  commit=$(awk -v t="refs/tags/v$version" '$2 == t "^{}" { p = $1 } $2 == t { d = $1 } END { print (p != "" ? p : d) }' <<<"$refs")
+                  [ -n "$commit" ] || { echo "::error::Upstream tag v$version not found"; exit 1; }
+                  status=$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $GH_TOKEN" \
+                      "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/git/ref/tags/android-v$version")
+                  case "$status" in
+                      200) echo "android-v$version already exists"; build=false
+                           if [ "${DRY_RUN:-false}" = true ]; then build=true; fi ;;
+                      404) build=true ;;
+                      *) echo "::error::GitHub API returned HTTP $status for android-v$version"; exit 1 ;;
+                  esac
+                  echo "Upstream v$version is $commit; build=$build"
+                  { echo "version=$version"; echo "commit=$commit"; echo "build=$build"; } >> "$GITHUB_OUTPUT"
+
+    release:
+        needs: check
+        if: needs.check.outputs.build == 'true'
+        runs-on: ubuntu-latest
+        timeout-minutes: 60
+        permissions:
+            contents: write
+        env:
+            VERSION: ${{ needs.check.outputs.version }}
+            SOURCE_COMMIT: ${{ needs.check.outputs.commit }}
+            RELEASE_TAG: android-v${{ needs.check.outputs.version }}
+            DRY_RUN: ${{ inputs.dry_run }}
+            HAPI_UPLOAD_KEY_ALIAS: hapi-sii
+            HAPI_UPLOAD_KEYSTORE_PASSWORD: ${{ secrets.HAPI_SII_ANDROID_KEYSTORE_PASSWORD }}
+            HAPI_UPLOAD_KEY_PASSWORD: ${{ secrets.HAPI_SII_ANDROID_KEYSTORE_PASSWORD }}
+        steps:
+            - uses: actions/checkout@v4
+              with:
+                  repository: ${{ env.UPSTREAM_REPO }}
+                  ref: ${{ needs.check.outputs.commit }}
+                  # versionCode = commit count; a shallow clone would undercount.
+                  fetch-depth: 0
+                  persist-credentials: false
+            - name: Verify source
+              run: |
+                  set -euo pipefail
+                  test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+                  test ! -e android/app/google-services.json
+            - uses: actions/setup-java@v4
+              with:
+                  distribution: temurin
+                  java-version: '21'
+            - uses: gradle/actions/setup-gradle@v4
+            - name: Install fork signing key and Firebase client configuration
+              env:
+                  KEYSTORE_BASE64: ${{ secrets.HAPI_SII_ANDROID_KEYSTORE_BASE64 }}
+                  GOOGLE_SERVICES_JSON: ${{ secrets.HAPI_SII_GOOGLE_SERVICES_JSON }}
+              run: |
+                  set -euo pipefail
+                  missing=""
+                  [ -n "$KEYSTORE_BASE64" ] || missing="$missing HAPI_SII_ANDROID_KEYSTORE_BASE64"
+                  [ -n "$HAPI_UPLOAD_KEYSTORE_PASSWORD" ] || missing="$missing HAPI_SII_ANDROID_KEYSTORE_PASSWORD"
+                  [ -n "$GOOGLE_SERVICES_JSON" ] || missing="$missing HAPI_SII_GOOGLE_SERVICES_JSON"
+                  [ -z "$missing" ] || { echo "::error::Missing repository secrets:$missing"; exit 1; }
+                  umask 077
+                  printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/hapi-sii.keystore"
+                  printf '%s' "$GOOGLE_SERVICES_JSON" > android/app/google-services.json
+                  echo "HAPI_UPLOAD_KEYSTORE=$RUNNER_TEMP/hapi-sii.keystore" >> "$GITHUB_ENV"
+            - name: Test and build signed release APK
+              # Same flags and unit tests as the official build (android-release.yml), without the AAB.
+              working-directory: android
+              run: |
+                  ./gradlew \
+                      -PhapiOfficialBuild=true \
+                      -PhapiFirebaseProjectId="$FIREBASE_PROJECT_ID" \
+                      -PhapiVersionName="$VERSION" \
+                      :core:protocol:test :core:data:testDebugUnitTest :app:testDebugUnitTest \
+                      :app:assembleRelease
+            - name: Remove build credentials
+              if: always()
+              run: rm -f -- "$RUNNER_TEMP/hapi-sii.keystore" android/app/google-services.json
+            - name: Verify and package APK
+              env:
+                  GH_TOKEN: ${{ github.token }}
+              run: |
+                  set -euo pipefail
+                  mkdir release-artifacts
+                  APK="hapi-sii-$VERSION.apk"
+                  cp android/app/build/outputs/apk/release/app-release.apk "release-artifacts/$APK"
+                  BT="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)"
+                  "$BT/apksigner" verify --verbose --print-certs "release-artifacts/$APK" > release-artifacts/signature.txt
+                  "$BT/aapt" dump badging "release-artifacts/$APK" > release-artifacts/apk-info.txt
+                  "$BT/aapt2" dump resources "release-artifacts/$APK" > "$RUNNER_TEMP/resources.txt"
+                  # The newest published release's build-info.json, so a new APK always upgrades it.
+                  echo '{}' > "$RUNNER_TEMP/prev-build-info.json"
+                  prev=$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=20" --jq '[.[] | select(.draft | not)][0].tag_name // ""')
+                  if [ -n "$prev" ]; then
+                      gh release download "$prev" --repo "$GITHUB_REPOSITORY" --pattern build-info.json \
+                          --output "$RUNNER_TEMP/prev-build-info.json" --clobber || echo "::warning::$prev has no build-info.json"
+                  fi
+                  python3 - <<'PY'
+                  import json, os, pathlib, re
+                  env = os.environ
+                  version, tmp = env['VERSION'], pathlib.Path(env['RUNNER_TEMP'])
+                  badging = pathlib.Path('release-artifacts/apk-info.txt').read_text()
+                  m = re.search(r"^package: name='([^']+)' versionCode='(\d+)' versionName='([^']+)'", badging, re.M)
+                  assert m, 'aapt badging has no package line'
+                  app_id, code, name = m.group(1), int(m.group(2)), m.group(3)
+                  assert app_id == 'run.hapi.companion', f'unexpected application id {app_id}'
+                  assert name == version, f'versionName {name} != {version}'
+                  assert 'application-debuggable' not in badging, 'APK is debuggable'
+                  sig = pathlib.Path('release-artifacts/signature.txt').read_text()
+                  assert sig.startswith('Verifies') and 'Number of signers: 1' in sig, 'signature verification failed'
+                  certs = re.findall(r'Signer #1 certificate SHA-256 digest: ([0-9a-f]{64})', sig)
+                  assert certs == [env['SIGNING_CERT_SHA256']], f'unexpected signing certificate {certs}'
+                  resources = (tmp / 'resources.txt').read_text()
+                  assert re.search(r'string/project_id\s*\n\s*\(\) "' + re.escape(env['FIREBASE_PROJECT_ID']) + '"', resources), \
+                      'Firebase configuration missing from the APK'
+                  try:
+                      prev = json.loads((tmp / 'prev-build-info.json').read_text() or '{}')
+                  except ValueError:
+                      prev = {}
+                  prev_code = int(prev.get('version_code') or 0)
+                  if code <= prev_code:
+                      msg = f'versionCode {code} is not above the newest release ({prev_code}); installed apps could not upgrade'
+                      if env.get('DRY_RUN') != 'true':
+                          raise SystemExit(f'::error::{msg}')
+                      print(f'::warning::{msg}')
+                  info = {
+                      'repository': env['GITHUB_REPOSITORY'],
+                      'upstream_repository': env['UPSTREAM_REPO'],
+                      'upstream_tag': f'v{version}',
+                      'source_commit': env['SOURCE_COMMIT'],
+                      'version_code': code,
+                      'version_name': name,
+                      'application_id': app_id,
+                      'firebase_push': True,
+                      'firebase_project': env['FIREBASE_PROJECT_ID'],
+                      'signing_cert_sha256': certs[0],
+                      'workflow_commit': env['GITHUB_SHA'],
+                      'run_url': f"{env['GITHUB_SERVER_URL']}/{env['GITHUB_REPOSITORY']}/actions/runs/{env['GITHUB_RUN_ID']}",
+                  }
+                  pathlib.Path('release-artifacts/build-info.json').write_text(json.dumps(info, indent=2) + '\n')
+                  print(f'{app_id} {name} (versionCode {code}), certificate {certs[0][:12]}..., Firebase {env["FIREBASE_PROJECT_ID"]}')
+                  PY
+                  (cd release-artifacts && sha256sum -- "$APK" apk-info.txt signature.txt build-info.json > checksums.txt)
+            - uses: actions/upload-artifact@v4
+              with:
+                  name: hapi-sii-android-${{ needs.check.outputs.version }}
+                  if-no-files-found: error
+                  path: release-artifacts/
+            - name: Publish release
+              if: env.DRY_RUN != 'true'
+              env:
+                  GH_TOKEN: ${{ github.token }}
+              run: |
+                  # -E: the ERR trap below must also fire for failures inside functions.
+                  set -eEuo pipefail
+                  code=$(jq -r .version_code release-artifacts/build-info.json)
+                  short="${SOURCE_COMMIT:0:8}"
+                  notes="$RUNNER_TEMP/release-notes.md"
+                  cat > "$notes" <<EOF
+                  这是 Android 手机上的 HAPI 伴侣应用，版本号与官方 v$VERSION 一致。上游发布 v$VERSION 后，由 GitHub Actions 自动构建。
+
+                  1. 在 Android 手机上下载安装附件中的 APK，打开 **HAPI → 扫描二维码**。
+                  2. 在电脑浏览器打开你的 Hub，进入 **设置 → 通用 → 伴侣应用配对 → 显示配对二维码**。
+                  3. 用手机应用扫描二维码完成绑定。Hub 必须使用手机可以访问的 HTTPS 地址；也可以在应用中手动输入 Hub 地址和访问令牌。
+
+                  包含 Firebase 配置（项目 \`$FIREBASE_PROJECT_ID\`），支持后台推送通知：Hub 需要配置同一 Firebase 项目的服务账号直连 FCM，官方推送中继无法给本包推送。手机需要 Google Play 服务并能连接 FCM。签名沿用本 fork 的固定密钥，可直接覆盖升级之前的版本。配对二维码包含访问令牌，请勿公开分享。
+
+                  Android APK built by GitHub Actions from upstream tag [v$VERSION](https://github.com/$UPSTREAM_REPO/releases/tag/v$VERSION), commit [$short](https://github.com/$UPSTREAM_REPO/commit/$SOURCE_COMMIT).
+
+                  - Version: $VERSION (Android versionCode $code), the same versionName as the official release.
+                  - Requires Android 8.0 / API 26 or newer and an HTTPS HAPI hub.
+                  - Signed with this fork's persistent key; future APKs using the same key and a higher versionCode can update this build.
+                  - Includes Firebase client configuration for project \`$FIREBASE_PROJECT_ID\`. Background push needs a hub configured with a service account from the same project; the official push relay cannot deliver to this build.
+                  - The package ID is run.hapi.companion. A build from another signer, including the official app, must be uninstalled before installing this APK; uninstalling removes its local app data.
+                  - Validation: protocol/data/app unit tests, release APK build with the official build checks, and checks of the signing certificate, version and Firebase project. Not tested on a device.
+                  - Build provenance, APK metadata, signing certificate fingerprint and SHA-256 checksums are attached.
+
+                  This is an unofficial build from $GITHUB_REPOSITORY, not an official upstream release.
+                  EOF
+                  api="repos/$GITHUB_REPOSITORY/releases"
+                  create_draft() {
+                      jq -n --arg tag "$RELEASE_TAG" --arg target "$1" --arg name "HAPI Android $VERSION" --rawfile body "$notes" \
+                          '{tag_name: $tag, target_commitish: $target, name: $name, body: $body, draft: true, prerelease: false}' \
+                          | gh api -X POST "$api" --input - --jq .id
+                  }
+                  publish() { gh api -X PATCH "$api/$rid" -F draft=false -f make_latest=true --silent; }
+                  # Draft first, so a failed upload never leaves a half-published release.
+                  # The tag should point at the upstream source commit; if GitHub refuses that
+                  # commit here, fall back to this workflow's commit (build-info.json keeps the source).
+                  rid=$(create_draft "$SOURCE_COMMIT" || create_draft "$GITHUB_SHA")
+                  trap 'echo "::error::Publishing failed; deleting draft release $rid"; gh api -X DELETE "$api/$rid" --silent || true' ERR
+                  for f in release-artifacts/*; do
+                      status=$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
+                          -H "Authorization: Bearer $GH_TOKEN" -H 'Content-Type: application/octet-stream' \
+                          --data-binary @"$f" "https://uploads.github.com/$api/$rid/assets?name=$(basename "$f")" || true)
+                      echo "uploaded $(basename "$f"): HTTP $status"
+                      [ "$status" = 201 ]
+                  done
+                  if ! publish; then
+                      echo "::warning::Could not tag $SOURCE_COMMIT here; tagging $GITHUB_SHA instead"
+                      gh api -X PATCH "$api/$rid" -f target_commitish="$GITHUB_SHA" --silent
+                      publish
+                  fi
+                  # Published: from here on a failure must not delete the release.
+                  trap - ERR
+                  gh api "$api/$rid" --jq '"Published \(.html_url) -> \(.tag_name)"' || true
